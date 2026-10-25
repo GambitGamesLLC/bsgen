@@ -1,6 +1,7 @@
 <p align="center"><img src="assets/logo.svg" width="280" alt="bsgen"></p>
 
-<p align="center">bsgen is an experimental Beat Saber map generator. It uses the <a href="https://huggingface.co/cata121/bsgen-1.0">bsgen-1.0</a> model.</p>
+<p align="center">bsgen is an experimental Beat Saber map generator. It uses the <a href="https://huggingface.co/cata121/bsgen-1.0">bsgen-1.0</a> model.<br>
+bsgen-1.0 has 65 million parameters and was trained in about 40 minutes on a single H100.</p>
 
 <p align="center"><a href="https://colab.research.google.com/github/cata02222/bsgen/blob/main/colab.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a></p>
 
@@ -25,9 +26,6 @@ python scripts/webui.py
 ## Web UI
 
 <img src="assets/webui.png" width="420" alt="the web page">
-
-Drop a song in, pick the stars, done. 65 M parameters: under a minute per song on a GPU, works
-on CPU too, just slower.
 
 ## Star it
 
