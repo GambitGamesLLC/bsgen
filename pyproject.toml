@@ -1,0 +1,23 @@
+[project]
+name = "bsgen"
+version = "1.0.0"
+description = "Beat Saber maps from any song"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = [
+    "gradio>=6.0",
+    "huggingface-hub>=0.25",
+    "librosa>=0.10",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "soundfile>=0.12",
+    "torch>=2.4",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bsgen"]
