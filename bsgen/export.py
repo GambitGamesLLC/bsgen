@@ -1,6 +1,7 @@
 import json
 import re
 import zipfile
+from itertools import combinations
 from pathlib import Path
 
 
@@ -13,6 +14,17 @@ def difficulty_for(stars):
         if stars < top:
             return name
     return "ExpertPlus"
+
+
+def difficulty_names(stars):
+    names = list(DIFF_RANK)
+    order = sorted(range(len(stars)), key=lambda i: stars[i])
+    want = [names.index(difficulty_for(stars[i])) for i in order]
+    best = min(combinations(range(len(names)), len(stars)), key=lambda c: sum(abs(x - w) for x, w in zip(c, want)))
+    out = [None] * len(stars)
+    for i, k in zip(order, best):
+        out[i] = names[k]
+    return out
 
 
 def safe_name(s: str) -> str:

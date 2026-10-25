@@ -17,6 +17,8 @@ ARCS = {"Off": None, "Rare": 0.0, "Normal": 0.025, "Lots": 0.08}
 VARIETY = {"Low": (0.0, 0.0), "Normal": (1.0, 0.0), "High": (1.0, 0.3)}
 DIFFS = {"Easy": (3.5, "Easy"), "Normal": (4.5, "Normal"), "Hard": (5.5, "Hard"), "Expert": (7.5, "Expert"),
          "Expert+": (10.0, "ExpertPlus")}
+MAX_LEVELS = 5
+START_STARS = (10, 7.5, 5.5, 12.5, 4)
 RED, BLUE = "#e8394b", "#2b8fd8"
 GITHUB = "https://github.com/cata02222/bsgen"
 
@@ -55,23 +57,27 @@ def number(text, name):
 
 
 def build(ckpt, device):
-    def make(song, mode, diff, stars, style, arcs, extras, variety, temp, cfg, njs, bpm, first_ms, seed, mapper, fmt):
+    def make(song, mode, diff, count, *rest):
+        stars, (style, arcs, extras, variety, temp, cfg, njs, bpm, first_ms, seed, mapper, fmt) = \
+            rest[:MAX_LEVELS], rest[MAX_LEVELS:]
         if not song:
             raise gr.Error("Add a song first.")
         if mode == "Stars":
-            levels = [(stars, None)]
+            levels = [(x, None) for x in sorted(set(stars[:count]))]
         else:
             levels = [DIFFS[d] for d in DIFFS if d in diff]
             if not levels:
                 raise gr.Error("Pick at least one difficulty.")
         folder = OUT / uuid.uuid4().hex[:10]
         folder.mkdir(parents=True)
-        argv = ["--audio", song, "--stars", *(f"{x:g}" for x, _ in levels), "--seed", str(int(seed)),
+        argv = ["--audio", song, "--stars", *(f"{x:g}" for x, _ in levels),
                 "--temp", f"{temp:g}", "--cfg", f"{cfg:g}", "--format", fmt, "--device", device, "--out", str(folder)]
         if mode != "Stars":
             argv += ["--difficulty", *(name for _, name in levels)]
         if ckpt:
             argv += ["--ckpt", ckpt]
+        if (seed := number(seed, "Seed")) is not None:
+            argv += ["--seed", str(int(seed))]
         if (njs := number(njs, "Note speed")) is not None:
             argv += ["--njs", f"{njs:g}"]
         if STYLES[style]:
@@ -130,7 +136,13 @@ def build(ckpt, device):
                 mode = gr.Radio(["Difficulty", "Stars"], value="Difficulty", show_label=False, elem_id="mode")
                 diff = gr.CheckboxGroup(list(DIFFS), value=["Expert+"], show_label=False,
                                         info="Pick more than one to get them all in one map")
-                stars = gr.Slider(1, 15, value=10, step=0.5, show_label=False, visible=False)
+                with gr.Group(visible=False) as star_box:
+                    stars = [gr.Slider(1, 15, value=v, step=0.5, label=f"Stars, difficulty {i + 1}", show_label=False,
+                                       visible=i == 0) for i, v in enumerate(START_STARS)]
+                    with gr.Row():
+                        more = gr.Button("+ another difficulty", size="sm")
+                        fewer = gr.Button("− remove", size="sm", visible=False)
+                count = gr.State(1)
             bpm = gr.Textbox(label="Song BPM", placeholder="e.g. 174", scale=1,
                              info="Enter it for the best map, or leave empty to detect it")
         with gr.Row():
@@ -148,15 +160,23 @@ def build(ckpt, device):
             with gr.Row():
                 njs = gr.Textbox(label="Note speed (NJS)", placeholder="auto",
                                  info="Leave empty for the usual speed of each difficulty")
-                seed = gr.Number(0, label="Seed", precision=0)
+                seed = gr.Textbox(label="Seed", placeholder="random",
+                                  info="The same seed and settings make the same map")
             first_ms = gr.Textbox(label="First beat (ms)", placeholder="found automatically",
                                   info="Song time of the first beat, with a BPM")
             mapper = gr.Dropdown(mappers, value="Any", label="Map like")
         go = gr.Button("Generate map", elem_id="go", size="lg")
         out = gr.File(label="Map (.zip)", height=90)
         log = gr.Textbox(label="Progress", lines=4, max_lines=8, interactive=False)
-        mode.change(lambda m: (gr.update(visible=m == "Difficulty"), gr.update(visible=m == "Stars")), mode, [diff, stars])
-        go.click(make, [song, mode, diff, stars, style, arcs, extras, variety, temp, cfg, njs, bpm, first_ms, seed, mapper, fmt],
+        def resize(n):
+            n = max(1, min(MAX_LEVELS, n))
+            return [n, *(gr.update(visible=i < n) for i in range(MAX_LEVELS)),
+                    gr.update(visible=n < MAX_LEVELS), gr.update(visible=n > 1)]
+
+        mode.change(lambda m: (gr.update(visible=m == "Difficulty"), gr.update(visible=m == "Stars")), mode, [diff, star_box])
+        more.click(lambda n: resize(n + 1), count, [count, *stars, more, fewer])
+        fewer.click(lambda n: resize(n - 1), count, [count, *stars, more, fewer])
+        go.click(make, [song, mode, diff, count, *stars, style, arcs, extras, variety, temp, cfg, njs, bpm, first_ms, seed, mapper, fmt],
                  [out, log])
     return demo
 

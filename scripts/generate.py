@@ -40,7 +40,7 @@ def parser():
     ap.add_argument("--candidates", type=int, default=4,
                     help="samples per window; one whose density is far from the others is passed over")
     ap.add_argument("--njs", type=float, nargs="+",
-                    help="note speed, one for every difficulty or one per difficulty (default: the usual one)")
+                    help="note speed, one for every difficulty or one per difficulty (default: the usual one for its stars)")
     ap.add_argument("--max-loop", type=float, default=sample.MAX_LOOP,
                     help="beats a pattern may repeat back to back before its continuation is penalized; 0: off")
     ap.add_argument("--dry", type=float, default=1.0,
@@ -63,13 +63,16 @@ def parser():
     ap.add_argument("--no-lights", action="store_true", help="leave the lightshow out")
     ap.add_argument("--format", choices=["v2", "v3"], default="v2",
                     help="v2: read by every viewer, two wall shapes; v3: exact wall shapes")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, help="the same seed and settings make the same map (default: random)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default=str(ROOT / "out"))
     return ap
 
 
 def run(args, model=None, log=print):
+    if args.seed is None:
+        args.seed = int(np.random.default_rng().integers(1_000_000))
+    log(f"seed {args.seed}")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -105,8 +108,10 @@ def run(args, model=None, log=print):
         log("\n".join(model.mappers) or "this model has no mapper control")
         return None
     stars = args.stars
-    names = args.difficulty or [export.difficulty_for(x) for x in stars]
-    njs = args.njs or [export.DIFF_NJS[n] for n in names]
+    if len(stars) > len(export.DIFF_RANK):
+        raise ValueError(f"at most {len(export.DIFF_RANK)} difficulties in one map")
+    names = args.difficulty or export.difficulty_names(stars)
+    njs = args.njs or [export.DIFF_NJS[export.difficulty_for(x)] for x in stars]
     if len(names) != len(stars) or len(njs) not in (1, len(stars)):
         raise ValueError("give one --difficulty per --stars value, and one --njs or one per --stars value")
     if len(set(names)) < len(names):
@@ -157,7 +162,11 @@ def run(args, model=None, log=print):
         levels.append(dict(difficulty=name, notes=notes, label=f"bsgen {star:g}★", njs=speed, bombs=bombs,
                            walls=walls, arcs=arcs, lights=show))
     tag = ",".join(f"{x:g}" for x in stars)
-    folder = Path(args.out) / export.safe_name(f"{title[:40]} {tag}star seed{args.seed}")
+    folder = Path(args.out) / export.safe_name(f"{title[:40]} {tag}star")
+    for n in range(2, 1000):
+        if not folder.exists() and not folder.with_name(folder.name + ".zip").exists():
+            break
+        folder = folder.with_name(export.safe_name(f"{title[:40]} {tag}star {n}"))
     export.write_pack(folder, audio_bytes, bpm, f"{title} (bsgen {stars[0]:g}★)" if len(stars) == 1 else f"{title} (bsgen)",
                       levels, tempo_changes=changes, fmt=args.format)
     log(f"wrote {folder}")
