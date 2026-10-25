@@ -2,3 +2,10 @@ __pycache__/
 *.egg-info/
 .venv/
 out/
+out-v2/
+out-v3/
+gen3/
+
+# Private test artifacts: never commit song audio, charts, or generated packages
+testdata/
+cover.jpg
