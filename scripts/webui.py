@@ -42,6 +42,16 @@ state = {"model": None}
 lock = threading.Lock()
 
 
+def number(text, name):
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        raise gr.Error(f"{name} should be a number, like 174.")
+
+
 def build(ckpt, device):
     def make(song, stars, style, arcs, extras, variety, temp, cfg, njs, bpm, first_ms, seed, mapper, fmt):
         if not song:
@@ -60,8 +70,11 @@ def build(ckpt, device):
                 argv.append(f"--no-{part.lower()}")
         dry, xtc = VARIETY[variety]
         argv += ["--dry", f"{dry:g}", "--xtc", f"{xtc:g}"]
+        bpm, first_ms = number(bpm, "Song BPM"), number(first_ms, "First beat")
         if bpm:
-            argv += ["--bpm", f"{bpm:g}", "--offset-ms", f"{first_ms or 0:g}"]
+            argv += ["--bpm", f"{bpm:g}"]
+            if first_ms is not None:
+                argv += ["--offset-ms", f"{first_ms:g}"]
         if mapper and mapper != "Any":
             argv += ["--mapper", mapper]
         args = generate.parser().parse_args(argv)
@@ -100,7 +113,10 @@ def build(ckpt, device):
         gr.HTML('<div id="title"><h1><span class="r">bs</span><span class="b">gen</span></h1>'
                 "<p>Beat Saber maps from any song</p></div>")
         song = gr.Audio(label="Song", type="filepath", sources=["upload"])
-        stars = gr.Slider(1, 15, value=10, step=0.5, label="Stars")
+        with gr.Row():
+            stars = gr.Slider(1, 15, value=10, step=0.5, label="Stars", scale=3)
+            bpm = gr.Textbox(label="Song BPM", placeholder="e.g. 174", scale=1,
+                             info="Enter it for the best map, or leave empty to detect it")
         with gr.Row():
             style = gr.Radio(list(STYLES), value="Auto", label="Style")
             arcs = gr.Radio(list(ARCS), value="Normal", label="Arcs")
@@ -116,9 +132,8 @@ def build(ckpt, device):
             with gr.Row():
                 njs = gr.Slider(10, 24, value=18, step=1, label="Note speed (NJS)")
                 seed = gr.Number(0, label="Seed", precision=0)
-            with gr.Row():
-                bpm = gr.Number(None, label="BPM", info="empty: detected from the song")
-                first_ms = gr.Number(None, label="First beat (ms)", info="with BPM")
+            first_ms = gr.Textbox(label="First beat (ms)", placeholder="found automatically",
+                                  info="Song time of the first beat, with a BPM")
             mapper = gr.Dropdown(mappers, value="Any", label="Map like")
         go = gr.Button("Generate map", elem_id="go", size="lg")
         out = gr.File(label="Map (.zip)", height=90)

@@ -29,7 +29,7 @@ def parser():
     ap.add_argument("--diff", default="ExpertPlus")
     ap.add_argument("--audio")
     ap.add_argument("--bpm", type=float, help="default: detected from the audio")
-    ap.add_argument("--offset-ms", type=float, default=0.0, help="song time of the first beat (with --bpm)")
+    ap.add_argument("--offset-ms", type=float, help="song time of the first beat (with --bpm; default: found in the audio)")
     ap.add_argument("--stars", type=float, required=True)
     ap.add_argument("--cfg", type=float, default=1.5)
     ap.add_argument("--temp", type=float, default=0.9)
@@ -82,13 +82,13 @@ def run(args, model=None, log=print):
         audio_bytes = ogg_vorbis(args.audio)
         y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
         title = Path(args.audio).stem
-        bpm, first = args.bpm, args.offset_ms / 1000
-        if not bpm:
+        bpm, first = args.bpm, (args.offset_ms or 0) / 1000
+        if not bpm or args.offset_ms is None:
             logmel, fps = sample.song_mel(y, sr)
             local = ROOT / "runs" / "timing"
             root = local if (local / "timing.safetensors").exists() else hub.timing_model()
-            bpm, first = timing.detect(logmel, fps, root, args.device)
-            log(f"timing: {bpm:.3f} BPM, first beat at {first * 1000:.0f} ms")
+            bpm, first = timing.detect(logmel, fps, root, args.device, bpm=bpm)
+            log(f"timing: {bpm:.3f} BPM{' (given)' if args.bpm else ''}, first beat at {first * 1000:.0f} ms")
         tempo = beatmap.TempoMap(bpm)
         offset = first * bpm / 60
     dur = len(y) / sr

@@ -166,14 +166,57 @@ def octave_class(trees, x):
     return int(trees["classes"][np.argmax(raw)])
 
 
-def detect(logmel, fps, root, dev="cuda"):
+def _shift(act, period, phase, lo, hi):
+    k = np.arange(np.ceil((lo - phase) / period), np.floor((hi - 1 - phase) / period) + 1)
+    r = max(1, int(period / 4))
+    offs, wts = [], []
+    for c in phase + k * period:
+        a, b = max(int(c) - r, 0), min(int(c) + r + 1, len(act))
+        seg = act[a:b]
+        if len(seg) < 3:
+            continue
+        j = int(np.argmax(seg))
+        offs.append(a + j - c), wts.append(float(seg[j]) ** 2)
+    return phase + float(np.average(offs, weights=wts)) if sum(wts) > 0 else phase
+
+
+def first_beat(act, fps, bpm, seg_sec=40.0):
+    lo, hi = 0, len(act)
+    period = 60 * fps / bpm
+    seg, mid = int(seg_sec * fps), hi // 2
+    a, b = max(lo, mid - seg // 2), min(hi, mid + seg // 2)
+    fit_bpm, fit_first, _ = fit_grid(act, fps)
+    fp = 60 * fps / fit_bpm
+    cands = [(fit_first * fps + m * fp) % period for m in range(int(np.ceil(period / fp)) + 1)]
+    phase = max(cands, key=lambda ph: _marks(act, period, ph, a, b)[0])
+    while True:
+        phase = _shift(act, period, phase, a, b)
+        if a <= lo and b >= hi:
+            break
+        w = b - a
+        a, b = max(lo, a - w // 2), min(hi, b + w // 2)
+    phase %= period
+    if _marks(act, period, 0.0, lo, hi)[0] >= ZERO_KEEP * _marks(act, period, phase, lo, hi)[0]:
+        return 0.0
+    return phase / fps
+
+
+ZERO_KEEP = 0.6
+
+
+def _activation(logmel, root, dev):
     from safetensors.torch import load_file
-    root = Path(root)
     model = BeatNet().to(dev)
-    model.load_state_dict(load_file(root / "timing.safetensors", device=str(dev)))
+    model.load_state_dict(load_file(Path(root) / "timing.safetensors", device=str(dev)))
     model.eval()
-    act = activation(model, logmel, dev)
+    return activation(model, logmel, dev)
+
+
+def detect(logmel, fps, root, dev="cuda", bpm=None):
+    act = _activation(logmel, root, dev)
+    if bpm:
+        return float(bpm), first_beat(act, fps, bpm)
     bpm, first, _ = fit_grid(act, fps)
     feats, cands = octave_features(act, fps, bpm, first)
-    bpm, first = cands[octave_class(dict(np.load(root / "octave.npz")), feats)]
+    bpm, first = cands[octave_class(dict(np.load(Path(root) / "octave.npz")), feats)]
     return float(bpm), float(first)
