@@ -26,17 +26,21 @@ def parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", help="map model checkpoint (default: the released model, downloaded once)")
     ap.add_argument("--map", help="take song + timing from this map zip")
-    ap.add_argument("--diff", default="ExpertPlus")
+    ap.add_argument("--diff", default="ExpertPlus", help="difficulty to read from --map")
+    ap.add_argument("--difficulty", nargs="+", choices=list(export.DIFF_RANK),
+                    help="one per --stars value (default: from the stars)")
     ap.add_argument("--audio")
     ap.add_argument("--bpm", type=float, help="default: detected from the audio")
     ap.add_argument("--offset-ms", type=float, help="song time of the first beat (with --bpm; default: found in the audio)")
-    ap.add_argument("--stars", type=float, required=True)
+    ap.add_argument("--stars", type=float, nargs="+", required=True,
+                    help="one difficulty per value, all in one level (e.g. --stars 4.5 7.5 10)")
     ap.add_argument("--cfg", type=float, default=1.5)
     ap.add_argument("--temp", type=float, default=0.9)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--candidates", type=int, default=4,
                     help="samples per window; one whose density is far from the others is passed over")
-    ap.add_argument("--njs", type=float, default=18.0)
+    ap.add_argument("--njs", type=float, nargs="+",
+                    help="note speed, one for every difficulty or one per difficulty (default: the usual one)")
     ap.add_argument("--max-loop", type=float, default=sample.MAX_LOOP,
                     help="beats a pattern may repeat back to back before its continuation is penalized; 0: off")
     ap.add_argument("--dry", type=float, default=1.0,
@@ -100,10 +104,16 @@ def run(args, model=None, log=print):
     if args.list_mappers:
         log("\n".join(model.mappers) or "this model has no mapper control")
         return None
+    stars = args.stars
+    names = args.difficulty or [export.difficulty_for(x) for x in stars]
+    njs = args.njs or [export.DIFF_NJS[n] for n in names]
+    if len(names) != len(stars) or len(njs) not in (1, len(stars)):
+        raise ValueError("give one --difficulty per --stars value, and one --njs or one per --stars value")
+    if len(set(names)) < len(names):
+        raise ValueError(f"two difficulties would share a name ({', '.join(names)}); name them with --difficulty")
+    njs = njs * len(stars) if len(njs) == 1 else njs
     objects = (0 if args.no_walls else tokens.OBJ_WALLS) | (0 if args.no_bombs else tokens.OBJ_BOMBS) \
         | (0 if args.no_arcs else tokens.OBJ_ARCS)
-    controls = dict(njs=args.njs, nps=args.nps, mapper=args.mapper, objects=objects, acc=args.acc_rating,
-                    tech=args.tech_rating, **{"pass": args.pass_rating})
     styles = None
     if args.style:
         styles = {}
@@ -115,30 +125,41 @@ def run(args, model=None, log=print):
     if not getattr(model, "controls", False) and (styles or args.mapper or args.nps):
         log("note: this model only takes a star rating; the other controls are ignored")
 
-    hooks = []
-    ev, b = sample.generate(model, logmel, fps, beat_times, offset, n_beats, args.stars, args.cfg, args.temp,
-                            args.top_p, dev=args.device, log=log, candidates=args.candidates,
-                            controls=controls, styles=styles, max_loop=args.max_loop, dry=args.dry,
-                            xtc=args.xtc, min_p=args.min_p, arc_boost=args.arc_boost,
-                            arc_rate=args.arc_rate, hooks=hooks)
-    bombs, walls, arcs = tokens.to_objects(ev, offset)
-    log(f"bombs {len(bombs)}, walls {len(walls)}, arcs {len(arcs)}")
-
-    notes = tokens.to_notes(ev, offset)
-    secs = tempo.to_seconds(notes["beat"])
-    span = secs.max() - secs.min() if len(notes) else 1
-    log(f"{len(notes)} notes, {len(notes) / span:.2f} notes/s, swings {np.sum(ev['kind'] == SWING)}"
-          f" ({np.mean(ev['air'][ev['kind'] == SWING]):.0%} air)")
-    log(f"probability the model put on moves the rules blocked: mean {b.mean():.1%}, "
-          f"steps where it was over half: {np.mean(b > 0.5):.1%}")
     changes = list(zip(tempo.beats[1:], tempo.bpms[1:])) if tempo.has_changes else []
-    show = [] if args.no_lights else lights.lightshow(notes, beat_times, logmel, fps, args.seed)
-    if show:
-        log(f"lights: {len(show)} events, {len(show) / max(notes['beat'].max() - notes['beat'].min(), 1):.1f} per beat")
-    folder = Path(args.out) / export.safe_name(f"{title[:40]} {args.stars:g}star seed{args.seed}")
-    export.write_level(folder, audio_bytes, notes, bpm, f"{title} (bsgen {args.stars:g}★)",
-                       f"bsgen {args.stars:g}★", njs=args.njs, tempo_changes=changes, bombs=bombs, walls=walls, arcs=arcs,
-                       fmt=args.format, lights=show)
+    levels = []
+    for star, name, speed in zip(stars, names, njs):
+        if len(stars) > 1:
+            log(f"{name}: {star:g}★, NJS {speed:g}")
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        controls = dict(njs=speed, nps=args.nps, mapper=args.mapper, objects=objects, acc=args.acc_rating,
+                        tech=args.tech_rating, **{"pass": args.pass_rating})
+        hooks = []
+        ev, b = sample.generate(model, logmel, fps, beat_times, offset, n_beats, star, args.cfg, args.temp,
+                                args.top_p, dev=args.device, log=log, candidates=args.candidates,
+                                controls=controls, styles=styles, max_loop=args.max_loop, dry=args.dry,
+                                xtc=args.xtc, min_p=args.min_p, arc_boost=args.arc_boost,
+                                arc_rate=args.arc_rate, hooks=hooks)
+        bombs, walls, arcs = tokens.to_objects(ev, offset)
+        log(f"bombs {len(bombs)}, walls {len(walls)}, arcs {len(arcs)}")
+
+        notes = tokens.to_notes(ev, offset)
+        secs = tempo.to_seconds(notes["beat"])
+        span = secs.max() - secs.min() if len(notes) else 1
+        log(f"{len(notes)} notes, {len(notes) / span:.2f} notes/s, swings {np.sum(ev['kind'] == SWING)}"
+            f" ({np.mean(ev['air'][ev['kind'] == SWING]):.0%} air)")
+        log(f"probability the model put on moves the rules blocked: mean {b.mean():.1%}, "
+            f"steps where it was over half: {np.mean(b > 0.5):.1%}")
+        show = [] if args.no_lights else lights.lightshow(notes, beat_times, logmel, fps, args.seed)
+        if show:
+            log(f"lights: {len(show)} events, "
+                f"{len(show) / max(notes['beat'].max() - notes['beat'].min(), 1):.1f} per beat")
+        levels.append(dict(difficulty=name, notes=notes, label=f"bsgen {star:g}★", njs=speed, bombs=bombs,
+                           walls=walls, arcs=arcs, lights=show))
+    tag = ",".join(f"{x:g}" for x in stars)
+    folder = Path(args.out) / export.safe_name(f"{title[:40]} {tag}star seed{args.seed}")
+    export.write_pack(folder, audio_bytes, bpm, f"{title} (bsgen {stars[0]:g}★)" if len(stars) == 1 else f"{title} (bsgen)",
+                      levels, tempo_changes=changes, fmt=args.format)
     log(f"wrote {folder}")
     return folder.parent / (folder.name + ".zip")
 
