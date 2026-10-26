@@ -4,9 +4,16 @@ import zipfile
 from itertools import combinations
 from pathlib import Path
 
+import numpy as np
+
 
 DIFF_RANK = {"Easy": 1, "Normal": 3, "Hard": 5, "Expert": 7, "ExpertPlus": 9}
-DIFF_NJS = {"Easy": 12.0, "Normal": 14.0, "Hard": 16.0, "Expert": 18.0, "ExpertPlus": 18.0}
+NJS_STARS = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5, 14.5]
+NJS_MEDIAN = [10.5, 10, 12, 14, 15, 16, 16, 17, 18, 19, 20, 20.5, 20.1, 20.2, 20]
+
+
+def typical_njs(stars):
+    return round(float(np.interp(stars, NJS_STARS, NJS_MEDIAN)) * 2) / 2
 
 
 def difficulty_for(stars):

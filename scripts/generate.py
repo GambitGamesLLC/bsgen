@@ -1,7 +1,9 @@
 import argparse
+import contextlib
 import io
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ from bsgen import beatmap, export, hub, lights, sample, timing, tokens
 from bsgen.tokens import SWING
 
 ROOT = Path(__file__).resolve().parents[1]
+GB_PER_DIFFICULTY = 1.0
 
 
 def ogg_vorbis(path):
@@ -63,13 +66,17 @@ def parser():
     ap.add_argument("--no-lights", action="store_true", help="leave the lightshow out")
     ap.add_argument("--format", choices=["v2", "v3"], default="v2",
                     help="v2: read by every viewer, two wall shapes; v3: exact wall shapes")
+    ap.add_argument("--replay", action="store_true",
+                    help="also play each difficulty with the player model and write its .bsor replay next to the map zip")
     ap.add_argument("--seed", type=int, help="the same seed and settings make the same map (default: random)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--parallel", type=int, help="difficulties made at the same time (default: as many as fit, up to 5)")
+    ap.add_argument("--verbose", action="store_true", help="log every window")
     ap.add_argument("--out", default=str(ROOT / "out"))
     return ap
 
 
-def run(args, model=None, log=print):
+def run(args, model=None, log=print, progress=None, player=None):
     if args.seed is None:
         args.seed = int(np.random.default_rng().integers(1_000_000))
     log(f"seed {args.seed}")
@@ -90,18 +97,27 @@ def run(args, model=None, log=print):
         y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
         title = Path(args.audio).stem
         bpm, first = args.bpm, (args.offset_ms or 0) / 1000
+        tempo = None
         if not bpm or args.offset_ms is None:
             logmel, fps = sample.song_mel(y, sr)
             local = ROOT / "runs" / "timing"
             root = local if (local / "timing.safetensors").exists() else hub.timing_model()
-            bpm, first = timing.detect(logmel, fps, root, args.device, bpm=bpm)
-            log(f"timing: {bpm:.3f} BPM{' (given)' if args.bpm else ''}, first beat at {first * 1000:.0f} ms")
-        tempo = beatmap.TempoMap(bpm)
-        offset = first * bpm / 60
+            if bpm:
+                bpm, first = timing.detect(logmel, fps, root, args.device, bpm=bpm)
+                log(f"timing: {bpm:.3f} BPM (given), first beat at {first * 1000:.0f} ms")
+            else:
+                tempo, offset, secs = timing.detect_tempo(logmel, fps, root, args.device)
+                bpm = secs[0][1]
+                log("timing: " + ", then ".join(f"{b:.3f} BPM" + (f" from {s:.1f} s" if s else "")
+                                                for s, b, _ in secs) + f", first beat at {secs[0][2] * 1000:.0f} ms")
+        if tempo is None:
+            tempo = beatmap.TempoMap(bpm)
+            offset = first * bpm / 60
     dur = len(y) / sr
     n_beats = int(tempo.to_beats(np.array([dur]))[0])
     log(f"song: {dur:.0f} s, {n_beats} beats")
     beat_times = tempo.to_seconds(np.arange(0, n_beats + 16, dtype=float))
+    grid_times = tempo.to_seconds(np.arange(0, n_beats + 16, dtype=float) + offset)
     logmel, fps = sample.song_mel(y, sr)
     model = model or sample.load_model(args.ckpt or hub.map_model(), args.device)
     if args.list_mappers:
@@ -111,7 +127,7 @@ def run(args, model=None, log=print):
     if len(stars) > len(export.DIFF_RANK):
         raise ValueError(f"at most {len(export.DIFF_RANK)} difficulties in one map")
     names = args.difficulty or export.difficulty_names(stars)
-    njs = args.njs or [export.DIFF_NJS[export.difficulty_for(x)] for x in stars]
+    njs = args.njs or [export.typical_njs(x) for x in stars]
     if len(names) != len(stars) or len(njs) not in (1, len(stars)):
         raise ValueError("give one --difficulty per --stars value, and one --njs or one per --stars value")
     if len(set(names)) < len(names):
@@ -131,36 +147,43 @@ def run(args, model=None, log=print):
         log("note: this model only takes a star rating; the other controls are ignored")
 
     changes = list(zip(tempo.beats[1:], tempo.bpms[1:])) if tempo.has_changes else []
-    levels = []
-    for star, name, speed in zip(stars, names, njs):
-        if len(stars) > 1:
-            log(f"{name}: {star:g}★, NJS {speed:g}")
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
+    def level(star, name, speed):
+        say = (lambda m: log(f"{name}: {m}")) if len(stars) > 1 else log
+        with sample.GATE.reading():
+            gen = torch.Generator(device=args.device).manual_seed(args.seed)
+            stream = torch.cuda.Stream() if str(args.device).startswith("cuda") else None
+        rng = np.random.default_rng(args.seed)
         controls = dict(njs=speed, nps=args.nps, mapper=args.mapper, objects=objects, acc=args.acc_rating,
                         tech=args.tech_rating, **{"pass": args.pass_rating})
         hooks = []
-        ev, b = sample.generate(model, logmel, fps, beat_times, offset, n_beats, star, args.cfg, args.temp,
-                                args.top_p, dev=args.device, log=log, candidates=args.candidates,
-                                controls=controls, styles=styles, max_loop=args.max_loop, dry=args.dry,
-                                xtc=args.xtc, min_p=args.min_p, arc_boost=args.arc_boost,
-                                arc_rate=args.arc_rate, hooks=hooks)
+        with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
+            ev, b = sample.generate(model, logmel, fps, grid_times, 0.0, n_beats, star, args.cfg, args.temp,
+                                    args.top_p, dev=args.device, log=say if args.verbose else None,
+                                    candidates=args.candidates, controls=controls, styles=styles,
+                                    max_loop=args.max_loop, dry=args.dry, xtc=args.xtc, min_p=args.min_p,
+                                    arc_boost=args.arc_boost, arc_rate=args.arc_rate, hooks=hooks, gen=gen, rng=rng,
+                                    progress=lambda beat: progress(name, beat, n_beats) if progress else None)
         bombs, walls, arcs = tokens.to_objects(ev, offset)
-        log(f"bombs {len(bombs)}, walls {len(walls)}, arcs {len(arcs)}")
-
         notes = tokens.to_notes(ev, offset)
         secs = tempo.to_seconds(notes["beat"])
         span = secs.max() - secs.min() if len(notes) else 1
-        log(f"{len(notes)} notes, {len(notes) / span:.2f} notes/s, swings {np.sum(ev['kind'] == SWING)}"
-            f" ({np.mean(ev['air'][ev['kind'] == SWING]):.0%} air)")
-        log(f"probability the model put on moves the rules blocked: mean {b.mean():.1%}, "
+        say(f"{star:g}★, NJS {speed:g}: {len(notes)} notes, {len(notes) / span:.2f} notes/s, "
+            f"swings {np.sum(ev['kind'] == SWING)} ({np.mean(ev['air'][ev['kind'] == SWING]):.0%} air), "
+            f"bombs {len(bombs)}, walls {len(walls)}, arcs {len(arcs)}")
+        say(f"probability the model put on moves the rules blocked: mean {b.mean():.1%}, "
             f"steps where it was over half: {np.mean(b > 0.5):.1%}")
         show = [] if args.no_lights else lights.lightshow(notes, beat_times, logmel, fps, args.seed)
         if show:
-            log(f"lights: {len(show)} events, "
-                f"{len(show) / max(notes['beat'].max() - notes['beat'].min(), 1):.1f} per beat")
-        levels.append(dict(difficulty=name, notes=notes, label=f"bsgen {star:g}★", njs=speed, bombs=bombs,
-                           walls=walls, arcs=arcs, lights=show))
+            say(f"lights: {len(show)} events, {len(show) / max(notes['beat'].max() - notes['beat'].min(), 1):.1f} per beat")
+        return dict(difficulty=name, notes=notes, label=f"bsgen {star:g}★", njs=speed, bombs=bombs,
+                    walls=walls, arcs=arcs, lights=show)
+
+    parallel = args.parallel
+    if parallel is None:
+        free = torch.cuda.mem_get_info()[0] / 1e9 if str(args.device).startswith("cuda") else len(stars)
+        parallel = int(free // GB_PER_DIFFICULTY)
+    with ThreadPoolExecutor(max(1, min(parallel, len(stars)))) as ex:
+        levels = list(ex.map(level, stars, names, njs))
     tag = ",".join(f"{x:g}" for x in stars)
     folder = Path(args.out) / export.safe_name(f"{title[:40]} {tag}star")
     for n in range(2, 1000):
@@ -170,7 +193,24 @@ def run(args, model=None, log=print):
     export.write_pack(folder, audio_bytes, bpm, f"{title} (bsgen {stars[0]:g}★)" if len(stars) == 1 else f"{title} (bsgen)",
                       levels, tempo_changes=changes, fmt=args.format)
     log(f"wrote {folder}")
-    return folder.parent / (folder.name + ".zip")
+    zip_path = folder.parent / (folder.name + ".zip")
+    if args.replay:
+        replays(zip_path, names, args, player, log, progress)
+    return zip_path
+
+
+def replays(zip_path, names, args, player=None, log=print, progress=None):
+    from bsgen import botplay
+    player = player or botplay.load_player(hub.player_model(), args.device)
+    out = []
+    for name in names:
+        path = zip_path.with_name(f"{zip_path.stem} {name}.bsor")
+        tick = (lambda done, total, name=name: progress(f"{name} replay", done, total)) if progress else None
+        s = botplay.play_map(player, zip_path, name, path, seed=args.seed or 0, dev=args.device, progress=tick)
+        log(f"{name} replay: {s['good']} of {s['notes']} notes cut, {s['bad']} bad cut{'s' * (s['bad'] != 1)}, "
+            f"{s['missed']} missed, score {s['score']}")
+        out.append(path)
+    return out
 
 
 def main():
