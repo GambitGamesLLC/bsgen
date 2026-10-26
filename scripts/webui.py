@@ -289,7 +289,8 @@ def build(ckpt, device):
             yield gr.update(value=None, visible=False), view.html(error=result["error"]), *no_watch
             raise gr.Error(result["error"])
         z = Path(result["zip"])
-        files = [str(z)] + [str(p) for p in sorted(z.parent.glob(f"{z.stem} *.bsor"))]
+        files = [str(z)] + sorted(str(p) for p in z.parent.iterdir()
+                                  if p.suffix == ".bsor" and p.name.startswith(z.stem + " "))
         if has_viewer:
             choices = watch_choices(z)
             watch = (gr.update(visible=True), gr.update(choices=choices, value=choices[0][1]), screen(choices[0][1]))
