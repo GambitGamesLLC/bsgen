@@ -5,6 +5,7 @@ out/
 out-*/
 gen*/
 probe*/
+verify*/
 gen-*/
 
 # Private test artifacts: never commit song audio, charts, or generated packages
