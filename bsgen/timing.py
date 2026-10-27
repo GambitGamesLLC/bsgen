@@ -92,7 +92,7 @@ def _refine(act, period, phase, lo, hi):
     return period, phase
 
 
-def fit_grid(act, fps, span=None, seg_sec=40.0):
+def fit_grid(act, fps, span=None, seg_sec=40.0, steps=401):
     lo, hi = span or (0, len(act))
     seg = int(seg_sec * fps)
     mid = (lo + hi) // 2
@@ -106,7 +106,7 @@ def fit_grid(act, fps, span=None, seg_sec=40.0):
     peaks = sorted(peaks, key=lambda lag: -ac[lag])[:6]
     best = (-np.inf, None, None)
     for p0 in peaks:
-        for rel in np.linspace(-0.04, 0.04, 401):
+        for rel in np.linspace(-0.04, 0.04, steps):
             s, ph = _score(act, p0 * (1 + rel), slo, shi)
             if s > best[0]:
                 best = (s, p0 * (1 + rel), ph)
@@ -220,3 +220,141 @@ def detect(logmel, fps, root, dev="cuda", bpm=None):
     feats, cands = octave_features(act, fps, bpm, first)
     bpm, first = cands[octave_class(dict(np.load(Path(root) / "octave.npz")), feats)]
     return float(bpm), float(first)
+
+
+SECTION_SEC, SECTION_HOP = 20.0, 10.0
+SWITCH = 0.1
+MIN_GAIN = 0.3
+RATIOS = (1, 2, 3, 4, 1 / 2, 1 / 3, 1 / 4, 2 / 3, 3 / 2, 3 / 4, 4 / 3)
+
+
+def related(a, b, tol=0.01):
+    return any(abs(a / b / r - 1) < tol for r in RATIOS)
+
+
+def _window_scores(act, fps):
+    W, H = int(SECTION_SEC * fps), int(SECTION_HOP * fps)
+    starts = list(range(0, max(len(act) - W, 0) + 1, H))
+    if starts[-1] + W < len(act):
+        starts.append(len(act) - W)
+    spans = [(lo, min(lo + W, len(act))) for lo in starts]
+    fits = [fit_grid(act, fps, s, SECTION_SEC, steps=33) for s in spans]
+    reps = []
+    for j in np.argsort([-f[2] for f in fits]):
+        if not any(related(fits[j][0], r) for r in reps):
+            reps.append(fits[j][0])
+    score = np.zeros((len(spans), len(reps)))
+    for i, (lo, hi) in enumerate(spans):
+        for k, r in enumerate(reps):
+            if related(fits[i][0], r):
+                score[i, k] = fits[i][2]
+            else:
+                p = 60 * fps / r
+                score[i, k] = max(_score(act, p * (1 + x), lo, hi)[0] for x in np.linspace(-0.005, 0.005, 11))
+    return spans, reps, score
+
+
+def _path(score, switch=SWITCH):
+    n, m = score.shape
+    best, back = score[0].copy(), np.zeros((n, m), int)
+    for i in range(1, n):
+        move = best.max() - switch
+        back[i] = np.where(best >= move, np.arange(m), int(best.argmax()))
+        best = np.maximum(best, move) + score[i]
+    path = [int(best.argmax())]
+    for i in range(n - 1, 0, -1):
+        path.append(int(back[i][path[-1]]))
+    path = path[::-1]
+    while True:
+        runs, i = [], 0
+        while i < n:
+            j = i
+            while j + 1 < n and path[j + 1] == path[i]:
+                j += 1
+            runs.append((i, j + 1, path[i]))
+            i = j + 1
+        weak = []
+        for k, (a, b, f) in enumerate(runs):
+            nb = [runs[q][2] for q in (k - 1, k + 1) if 0 <= q < len(runs)]
+            if not nb:
+                continue
+            gain = min((score[a:b, f] - score[a:b, g]).sum() for g in nb)
+            if gain < MIN_GAIN or b - a < 2:
+                weak.append((gain if b - a >= 2 else -np.inf, a, b, max(nb, key=lambda g: score[a:b, g].sum())))
+        if not weak:
+            return path
+        _, a, b, g = min(weak)
+        path[a:b] = [g] * (b - a)
+
+
+def _local(act, fps, bpm, first, lo, hi, step):
+    period = 60 * fps / bpm
+    k = np.arange(np.ceil((lo - fps - first * fps) / period), np.floor((hi + fps - first * fps) / period) + 1)
+    beats = first * fps + k * period
+
+    def peak(pos):
+        g = np.clip(np.round(pos).astype(int), 1, len(act) - 2)
+        return np.max([act[g - 1], act[g], act[g + 1]], 0)
+
+    on = peak(beats)
+    sub = np.stack([peak(beats + f * period) for f in SUBDIVISIONS])
+    out = []
+    for x in range(lo, hi, step):
+        sel = np.abs(beats - x) <= fps
+        out.append(on[sel].mean() - sub[:, sel].mean(1).max() if sel.any() else 0.0)
+    return np.array(out)
+
+
+def _fit(act, fps, span, trees):
+    bpm, first, _ = fit_grid(act, fps, span)
+    feats, cands = octave_features(act, fps, bpm, first, span)
+    return cands[octave_class(trees, feats)]
+
+
+def sections(act, fps, trees):
+    spans, reps, score = _window_scores(act, fps)
+    path = _path(score)
+    cuts = [i for i in range(1, len(path)) if path[i] != path[i - 1]]
+    if not cuts:
+        return [(0.0, *_fit(act, fps, (0, len(act)), trees))]
+    zones = [(spans[i][0], spans[i - 1][1]) for i in cuts]
+    cores = [(a[1] if a else 0, b[0] if b else len(act)) for a, b in zip([None] + zones, zones + [None])]
+    grids = [_fit(act, fps, c, trees) for c in cores]
+    out = [(0.0, *grids[0])]
+    step = int(0.25 * fps)
+    for (lo, hi), g in zip(zones, grids[1:]):
+        lo, hi = max(lo - spans[0][1] // 4, 0), min(hi + spans[0][1] // 4, len(act))
+        gain = np.cumsum(_local(act, fps, *out[-1][1:], lo, hi, step) - _local(act, fps, *g, lo, hi, step))
+        x = (lo + step * int(np.argmax(gain))) / fps
+        if related(out[-1][1], g[0], 0.002):
+            continue
+        out.append((x, *g))
+    return out
+
+
+def tempo_map(secs):
+    from .beatmap import TempoMap
+    _, bpm0, beat0 = secs[0]
+    offset = beat0 * bpm0 / 60 % 1
+    changes = []
+    for start, bpm, beat in secs[1:]:
+        tm = TempoMap(bpm0, changes)
+        p = 60 / bpm
+        first = beat + np.ceil((start - beat) / p) * p
+        n = np.floor(tm.to_beats(first) - 0.5 - offset) + offset
+        gap = first - tm.to_seconds(n)
+        changes += [(float(n), 60 / gap), (float(n + 1), bpm)]
+    return TempoMap(bpm0, changes), offset
+
+
+def detect_tempo(logmel, fps, root, dev="cuda"):
+    act = _activation(logmel, root, dev)
+    trees = dict(np.load(Path(root) / "octave.npz"))
+    secs = sections(act, fps, trees)
+    if len(secs) == 1:
+        bpm, first, _ = fit_grid(act, fps)
+        feats, cands = octave_features(act, fps, bpm, first)
+        bpm, first = cands[octave_class(trees, feats)]
+        secs = [(0.0, float(bpm), float(first))]
+    tm, offset = tempo_map(secs)
+    return tm, offset, secs

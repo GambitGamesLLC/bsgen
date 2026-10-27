@@ -1,4 +1,6 @@
+import contextlib
 import json
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -6,8 +8,8 @@ import torch
 
 from . import tokens
 from .data import beat_mel, beat_to_sec, overview_rel, song_overview
-from .model import Generator
-from .tokens import ARC, CONTEXT, NOTE, OBJ_ARCS, OBJ_BOMBS, OBJ_WALLS, SWING, TICKS, VOCAB, WALL, WINDOW
+from .model import Generator, GraphStep
+from .tokens import ARC, BOMB, CONTEXT, NOTE, OBJ_ARCS, OBJ_BOMBS, OBJ_WALLS, SWING, TICKS, VOCAB, WALL, WINDOW
 
 FOREHAND_DIRS = {1, 6, 7, 2, 3, 8}
 BACKHAND_DIRS = {0, 4, 5, 2, 3, 8}
@@ -34,6 +36,8 @@ def _wall_cells(shape):
 
 WALL_CELLS = [_wall_cells(sh) for sh in range(tokens.N_SHAPES)]
 WALL_CAP, FEW_NOTES = 105, 4
+BOMB_CAP_STARS, BOMB_CAP = [2, 6, 10, 14], [64, 178, 300, 474]
+BOMB_RATIO = 1.0
 MAX_LOOP = 16
 LOOP_PERIODS = 32
 LOOP_MATCH = 0.85
@@ -55,7 +59,7 @@ class LoopGuard:
         self.overused = []
         self.repeats, self.stale = [], False
 
-    def add(self, tick, hand, cell, d):
+    def add(self, tick, hand, cell, d, check=True):
         gap = tick - self.ticks[-1] if self.ticks else 0
         self.sym.append((hand, cell, d, gap))
         self.ticks.append(tick)
@@ -64,9 +68,16 @@ class LoopGuard:
             del self.sym[:64], self.ticks[:64], self.codes[:64]
         self.stale = self.dry > 0
         self.expect, self.overused = [], []
-        if self.limit <= 0:
+        if check:
+            self.check()
+
+    def check(self):
+        self.expect, self.overused = [], []
+        if self.limit <= 0 or not self.ticks:
             return
+        tick = self.ticks[-1]
         ticks = np.asarray(self.ticks)
+        codes = np.asarray(self.codes)
         n = len(ticks)
         since = int(np.searchsorted(ticks, tick - VARIETY_BEATS * TICKS, "right"))
         recent = {s[:3] for s in self.sym[since:]}
@@ -79,7 +90,7 @@ class LoopGuard:
         for p in range(1, LOOP_PERIODS + 1):
             if n - first < 2 * p or first < p:
                 continue
-            same = np.mean([self.sym[i] == self.sym[i - p] for i in range(first, n)])
+            same = np.mean(codes[first:n] == codes[first - p:n - p])
             if same < LOOP_MATCH:
                 continue
             start = first
@@ -152,7 +163,7 @@ class Rules:
                 self._new_moment(int(e["tick"]))
             h, k = int(e["hand"]), int(e["kind"])
             if k == NOTE:
-                self.loops.add(self.tick, h, int(e["cell"]), int(e["dir"]))
+                self.loops.add(self.tick, h, int(e["cell"]), int(e["dir"]), check=False)
                 self.notes_now[h].append(int(e["cell"]) * 9 + int(e["dir"]))
                 self.opened[h] = True
                 self.stack[h] += 1
@@ -164,6 +175,7 @@ class Rules:
                 self.first_dir[h] = None
             elif k == WALL:
                 self._add_wall(int(e["shape"]), int(e["dur"]))
+        self.loops.check()
         self.after_time = False
 
     def begin(self, t0, tick):
@@ -304,65 +316,140 @@ class Rules:
             self.need_dur = False
 
 
+GRAPHS = True
+
+
+class Gate:
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.readers = self.waiting = 0
+        self.recording = False
+
+    @contextlib.contextmanager
+    def reading(self):
+        with self.cond:
+            self.cond.wait_for(lambda: not self.recording and not self.waiting)
+            self.readers += 1
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.readers -= 1
+                self.cond.notify_all()
+
+    @contextlib.contextmanager
+    def writing(self):
+        with self.cond:
+            self.waiting += 1
+            self.cond.wait_for(lambda: not self.recording and not self.readers)
+            self.waiting -= 1
+            self.recording = True
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.recording = False
+                self.cond.notify_all()
+
+
+GATE = Gate()
+_pool_lock = threading.Lock()
+
+
+def take_graph(model, batch, mem_len):
+    with _pool_lock:
+        pool = model.__dict__.setdefault("_graphs", {})
+        for key in [k for k in pool if k[1] != mem_len]:
+            del pool[key]
+        free = pool.setdefault((batch, mem_len), [])
+        if free:
+            return free.pop()
+    graph = GraphStep(model, batch, mem_len)
+    with GATE.writing():
+        graph.capture()
+    return graph
+
+
+def give_graph(model, graph):
+    with _pool_lock:
+        model.__dict__.setdefault("_graphs", {}).setdefault((graph.tok.shape[0], graph.mk[0].shape[2]), []).append(graph)
+
+
 @torch.no_grad()
 def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev, xtc=0.0, min_p=0.0, arc_boost=0.0,
-                  hooks=()):
+                  hooks=(), gen=None, rng=None):
     n, k = len(rules), len(prefixes) - 1
     guided = cfg != 1.0 or k > 1
-    memory = model.encode(*(torch.as_tensor(a)[None].to(dev) for a in audio))
+    use_graph = str(dev).startswith("cuda") and GRAPHS
+    with GATE.reading():
+        memory = model.encode(*(torch.as_tensor(a)[None].to(dev) for a in audio))
+        mem_len = memory.shape[1]
     rows = [list(p) for p in prefixes[1:] for _ in range(n)] + ([list(prefixes[0]) for _ in range(n)] if guided else [])
     start = len(rows[0])
-    w = torch.tensor(weights, device=dev, dtype=torch.float32)[:, None, None]
     vocab, max_len = model.tok.weight.shape[0], model.dec_pos.shape[0]
     done = np.zeros(n, bool)
     blocked = [[] for _ in range(n)]
     eos = np.zeros(vocab, bool)
     eos[VOCAB.EOS] = True
-    cache, step = {}, torch.tensor(rows, device=dev)
-    while len(rows[0]) < max_len and not done.all():
-        lg = model.decode_step(memory, step, cache).float()
-        if guided:
-            u = lg[k * n:]
-            lg = u + cfg * (w * (lg[:k * n].view(k, n, -1) - u)).sum(0)
-        allowed = torch.from_numpy(np.stack([eos if done[i] else r.mask()[:vocab] for i, r in enumerate(rules)])).to(dev)
-        bp = (torch.softmax(lg / temp, -1) * ~allowed).sum(1).tolist()
-        if arc_boost:
-            lg[:, VOCAB.arc0:VOCAB.arc0 + 2] += arc_boost
-        for i, r in enumerate(rules):
-            if not done[i]:
-                for tok, amount in r.loops.penalty(r):
-                    lg[i, tok] -= amount
-        for hook in hooks:
-            hook(lg, rules)
-        lg[~allowed] = -float("inf")
-        pr = torch.softmax(lg / temp, -1)
-        if xtc > 0:
-            for i, r in enumerate(rules):
-                if not done[i] and r.need_note is not None and np.random.random() < xtc:
-                    top = torch.nonzero(pr[i] >= XTC_THRESHOLD)[:, 0]
-                    if len(top) >= 2:
-                        pr[i, top[pr[i, top] > pr[i, top].min()]] = 0
-        sp, si = torch.sort(pr, -1, descending=True)
-        if min_p > 0:
-            sp[sp < min_p * sp[:, :1]] = 0
-        else:
-            sp[torch.cumsum(sp, -1) - sp >= top_p] = 0
-        ks = si.gather(1, torch.multinomial(sp, 1))[:, 0].tolist()
-        for i, t in enumerate(ks):
-            if not done[i]:
-                blocked[i].append(bp[i])
-                if t == VOCAB.EOS:
-                    done[i] = True
+    rng = rng or np.random
+    graph = take_graph(model, len(rows), mem_len) if use_graph else None
+    try:
+        with GATE.reading():
+            w = torch.tensor(weights, device=dev, dtype=torch.float32)[:, None, None]
+            cache, step = {}, torch.tensor(rows, device=dev)
+            first = True
+            while len(rows[0]) < max_len and not done.all():
+                if graph is None:
+                    lg = model.decode_step(memory, step, cache).float()
                 else:
-                    rules[i].push(t)
-            for j in range(i, len(rows), n):
-                rows[j].append(t)
-        step = torch.tensor([r[-1:] for r in rows], device=dev)
-    new = []
-    for i in range(n):
-        t = rows[i][start:]
-        new.append(t[:t.index(VOCAB.EOS)] if VOCAB.EOS in t else t)
-    return new, blocked
+                    lg = (graph.prefill(memory, step) if first else graph.step(step)).float().clone()
+                first = False
+                if guided:
+                    u = lg[k * n:]
+                    lg = u + cfg * (w * (lg[:k * n].view(k, n, -1) - u)).sum(0)
+                allowed = torch.from_numpy(np.stack([eos if done[i] else r.mask()[:vocab] for i, r in enumerate(rules)])).to(dev)
+                bp = (torch.softmax(lg / temp, -1) * ~allowed).sum(1).tolist()
+                if arc_boost:
+                    lg[:, VOCAB.arc0:VOCAB.arc0 + 2] += arc_boost
+                for i, r in enumerate(rules):
+                    if not done[i]:
+                        for tok, amount in r.loops.penalty(r):
+                            lg[i, tok] -= amount
+                for hook in hooks:
+                    hook(lg, rules)
+                lg[~allowed] = -float("inf")
+                pr = torch.softmax(lg / temp, -1)
+                if xtc > 0:
+                    for i, r in enumerate(rules):
+                        if not done[i] and r.need_note is not None and rng.random() < xtc:
+                            top = torch.nonzero(pr[i] >= XTC_THRESHOLD)[:, 0]
+                            if len(top) >= 2:
+                                pr[i, top[pr[i, top] > pr[i, top].min()]] = 0
+                sp, si = torch.sort(pr, -1, descending=True)
+                if min_p > 0:
+                    sp[sp < min_p * sp[:, :1]] = 0
+                else:
+                    sp[torch.cumsum(sp, -1) - sp >= top_p] = 0
+                ks = si.gather(1, torch.multinomial(sp, 1, generator=gen))[:, 0].tolist()
+                for i, t in enumerate(ks):
+                    if not done[i]:
+                        blocked[i].append(bp[i])
+                        if t == VOCAB.EOS:
+                            done[i] = True
+                        else:
+                            rules[i].push(t)
+                    for j in range(i, len(rows), n):
+                        rows[j].append(t)
+                step = torch.tensor([r[-1:] for r in rows], device=dev)
+            new = []
+            for i in range(n):
+                t = rows[i][start:]
+                new.append(t[:t.index(VOCAB.EOS)] if VOCAB.EOS in t else t)
+            return new, blocked
+    finally:
+        if graph is not None:
+            give_graph(model, graph)
 
 
 def window_activity(logmel, fps, beat_times, offset, spans):
@@ -389,10 +476,12 @@ def read_checkpoint(path):
 
 
 def load_model(path, dev="cuda"):
+    torch.backends.cuda.matmul.allow_tf32 = True
     ck = read_checkpoint(path)
     a = ck["args"]
     vocab, max_tokens = ck["model"]["tok.weight"].shape[0], ck["model"]["dec_pos"].shape[0]
     model = Generator(vocab, d=a["d"], enc_layers=a["layers"], dec_layers=a["layers"], heads=a["d"] // 64,
+                      conv_blocks=a.get("conv_blocks", 0), global_cond=a.get("global_cond", False),
                       max_tokens=max_tokens)
     model.load_state_dict(ck["model"])
     model.controls = vocab >= VOCAB.size
@@ -403,7 +492,7 @@ def load_model(path, dev="cuda"):
 
 def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, temp=0.9, top_p=0.95,
              dev="cuda", log=None, candidates=1, controls=None, styles=None, max_loop=MAX_LOOP, dry=0.0, xtc=0.0,
-             min_p=0.0, arc_boost=0.0, arc_rate=0.0, hooks=()):
+             min_p=0.0, arc_boost=0.0, arc_rate=0.0, hooks=(), gen=None, rng=None, progress=None):
     if getattr(model, "controls", False):
         c = dict(controls or {})
         if c.get("mapper") is not None:
@@ -423,6 +512,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
     ev, blocked = np.zeros(0, tokens.EVENT_DTYPE), []
     target = c.get("nps") if getattr(model, "controls", False) else None
     first_sec = None
+    bomb_cap = int(np.interp(stars if stars is not None else BOMB_CAP_STARS[-1], BOMB_CAP_STARS, BOMB_CAP))
     ov, bar = song_overview(logmel, fps, beat_times, offset)
     behind = behind_wall_ticks((c.get("njs") if getattr(model, "controls", False) else None) or 18.0, beat_times)
     swings = getattr(model, "swings", True)
@@ -432,14 +522,14 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
         end = min(t0 + (CONTEXT + WINDOW) * TICKS, (n_beats - 2) * TICKS)
         audio = (beat_mel(logmel, fps, beat_times, b + offset), ov, overview_rel(bar, b))
 
-        def draw(hide_walls):
+        def draw(hide_walls, allow=objects):
             prev = ev[(ev["tick"] >= t0) & (ev["tick"] < new0)]
             if hide_walls:
                 prev = prev[prev["kind"] != WALL]
             prefixes = [tokens.encode(prev, t0, c, beats=CONTEXT)[:-1] for c in [uncond] + conds]
             rules = []
             for _ in range(candidates):
-                r = Rules(ev, end, swings, objects, max_loop, behind, dry)
+                r = Rules(ev, end, swings, allow, max_loop, behind, dry)
                 r.begin(t0, new0 - 1)
                 rules.append(r)
             boost = arc_boost
@@ -447,7 +537,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
                 under = np.sum(ev["kind"] == ARC) < arc_rate * max(np.sum(ev["kind"] == NOTE), 1)
                 boost = ARC_PUSH if under else -ARC_PUSH
             new, bl = sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev, xtc, min_p, boost,
-                                    hooks)
+                                    hooks, gen, rng)
             got = [tokens.decode(prefixes[1] + t, t0) for t in new]
             return [g[g["tick"] >= new0] for g in got], bl
 
@@ -464,13 +554,22 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             note = " [gap: redrawn without the lookback walls]"
         counts = np.array([np.sum(g["kind"] == NOTE) for g in got])
         walls = np.array([np.sum(g["kind"] == WALL) for g in got])
+        bombs = np.array([np.sum(g["kind"] == BOMB) for g in got])
+        have_b, have_n = np.sum(ev["kind"] == BOMB), np.sum(ev["kind"] == NOTE)
+        bomb_ok = (bombs <= bomb_cap) & (have_b + bombs <= BOMB_RATIO * (have_n + counts) + bomb_cap)
+        if not bomb_ok.any():
+            got, bl = draw(False, objects & ~OBJ_BOMBS)
+            note += " [bombs: redrawn without]"
+            counts = np.array([np.sum(g["kind"] == NOTE) for g in got])
+            walls = np.array([np.sum(g["kind"] == WALL) for g in got])
+            bombs = np.zeros(len(got), int); bomb_ok = np.ones(len(got), bool)
         ok = [i for i, g in enumerate(got) if gap(g) <= limit] or list(range(len(got)))
         gap_k = ok[pick_candidate(counts[ok])]
         if len(ok) < len(got) and gap_k != pick_candidate(counts):
             note += " [gap: passed over an empty candidate]"
-        if np.sum(counts >= FEW_NOTES) * 2 > len(got):
-            ok = [i for i in ok if counts[i] >= FEW_NOTES] or ok
-        ok = [i for i in ok if walls[i] <= WALL_CAP] or ok
+        few = (counts < FEW_NOTES) & (np.sum(counts >= FEW_NOTES) * 2 > len(got))
+        bad = few.astype(int) + (walls > WALL_CAP) + ~bomb_ok
+        ok = [i for i in ok if bad[i] == bad[ok].min()]
         k = ok[pick_candidate(counts[ok])]
         if target and first_sec is not None:
             med = np.median(counts[ok])
@@ -484,6 +583,10 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             g = got[k]
             got[k] = g[(g["kind"] != WALL) | (np.cumsum(g["kind"] == WALL) <= WALL_CAP)]
             note += f" [walls cut to {WALL_CAP}]"
+        if bombs[k] > bomb_cap:
+            g = got[k]
+            got[k] = g[(g["kind"] != BOMB) | (np.cumsum(g["kind"] == BOMB) <= bomb_cap)]
+            note += f" [bombs cut to {bomb_cap}]"
         ev = np.concatenate([ev, got[k]])
         blocked += bl[k]
         if counts[k]:
@@ -494,6 +597,8 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             log(f"beat {b + CONTEXT:4d}-{b + CONTEXT + WINDOW:4d}: {counts[k]} notes"
                 + (f" (candidates {' '.join(map(str, counts))})" if candidates > 1 else "")
                 + f", walls {walls[k]} ({' '.join(map(str, walls))})" + note)
+        if progress:
+            progress(min(b + CONTEXT + WINDOW, n_beats))
     return ev, np.array(blocked)
 
 

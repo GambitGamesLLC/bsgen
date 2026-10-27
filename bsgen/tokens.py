@@ -119,6 +119,35 @@ class Vocab:
 VOCAB = Vocab()
 
 
+def air_ticks(hands, first, raw):
+    out = np.full(len(hands), -1, np.int64)
+    order = np.asarray(raw, np.int64).copy()
+    for s, t in first.items():
+        out[s] = order[s] = t
+    for h in np.unique(hands):
+        idx = np.flatnonzero(hands == h)
+        idx = idx[np.argsort(order[idx], kind="stable")]
+        run, prev = [], None
+        for s in idx:
+            if s not in first:
+                run.append(s)
+                continue
+            nxt = int(order[s])
+            if prev is not None and len(run) % 2:
+                out[run[0]] = reset_tick(prev, nxt)
+            run, prev = [], nxt
+    return out
+
+
+def reset_tick(prev, nxt):
+    mid = (prev + nxt) / 2
+    for step in (TICKS // 4, TICKS // 8, TICKS // 12, TICKS // 16, 1):
+        lo, hi = prev // step + 1, -(-nxt // step) - 1
+        if lo <= hi:
+            return int(np.clip(round(mid / step), lo, hi) * step)
+    return prev + 1 if nxt - prev > 1 else nxt
+
+
 def events(notes, owner, swings, swing_beat, grid_offset, bombs=None, walls=None, arcs=None):
     tick = lambda b: np.round((np.asarray(b) - grid_offset) * TICKS).astype(np.int64)
     nt = tick(notes["beat"])
@@ -126,11 +155,10 @@ def events(notes, owner, swings, swing_beat, grid_offset, bombs=None, walls=None
     for i in np.argsort(nt, kind="stable"):
         if owner[i] >= 0:
             first.setdefault(int(owner[i]), int(nt[i]))
+    ticks = air_ticks(swings["hand"], first, tick(swing_beat))
     ev = []
-    for s in range(len(swings)):
-        has = s in first
-        ev.append((first[s] if has else int(tick(swing_beat[s])), SWING, swings["hand"][s],
-                   swings["forehand"][s], not has, -1, -1, -1, -1, 0))
+    for s in np.flatnonzero(ticks >= 0):
+        ev.append((ticks[s], SWING, swings["hand"][s], swings["forehand"][s], s not in first, -1, -1, -1, -1, 0))
     for i in range(len(notes)):
         ev.append((nt[i], NOTE, notes["color"][i], False, False,
                    notes["layer"][i] * 4 + notes["line"][i], notes["cut_dir"][i], i, -1, 0))

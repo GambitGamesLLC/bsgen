@@ -20,7 +20,9 @@ COND_DROPOUT = dict(stars=0.15, style=0.3, mapper=0.5, njs=0.5, nps=0.5, objects
 ALL_DROPOUT = 0.1
 WALL_LOOKBACK_DROPOUT = 0.2
 MIN_ON_GRID = 0.6
-CACHE_VERSION = "3"
+CACHE_VERSION = "4"
+EVENT_VERSION = "5"
+LABELLED = "labelled"
 AUDIO_VERSION = "1"
 
 
@@ -104,16 +106,20 @@ def row_cond(r, mappers):
 class Windows(torch.utils.data.Dataset):
 
     def __init__(self, root: Path, rows: list[dict], lookback_dropout=0.1, train=True, swings=True, mappers=None,
-                 controls=True):
+                 controls=True, labelled_stars=True):
         self.root, self.train = Path(root), train
         self.swings = swings
         self.controls = controls
         self.lookback_dropout = lookback_dropout
         self.mappers = mappers or []
         self.cond = [row_cond(r, self.mappers) for r in rows]
+        if not labelled_stars:
+            for r, c in zip(rows, self.cond):
+                if r.get("source") == LABELLED:
+                    c["stars"] = None
         self.hashes = sorted({r["hash"] for r in rows})
         files = "\n".join(r["file"] for r in rows)
-        key = hashlib.sha1((files + CACHE_VERSION).encode()).hexdigest()[:16]
+        key = hashlib.sha1((files + CACHE_VERSION + EVENT_VERSION).encode()).hexdigest()[:16]
         cache = self.root / "cache" / f"windows_{key}.npz"
         if cache.exists():
             z = np.load(cache)
@@ -186,6 +192,8 @@ class Windows(torch.utils.data.Dataset):
                 s = self.song_hash[si]
                 bt = self.bt[self.bt_start[si]:self.bt_start[si + 1]]
                 ov[j], bar[j] = song_overview(au[au_start[s]:au_start[s + 1]], fps[s], bt, float(self.offset[si]))
+                if j % 1000 == 999:
+                    ov.flush()
             ov.flush()
             del au, ov
             tmp.with_suffix(".f16").replace(self.au_path)
@@ -251,14 +259,16 @@ class Windows(torch.utils.data.Dataset):
 
 class LengthBatches(torch.utils.data.Sampler):
 
-    def __init__(self, lengths, batch, pool=64):
+    def __init__(self, lengths, batch, pool=64, weights=None):
         self.lengths, self.batch, self.pool = np.asarray(lengths), batch, pool
+        self.p = None if weights is None else np.asarray(weights, np.float64) / np.sum(weights)
 
     def __len__(self):
         return len(self.lengths) // self.batch
 
     def __iter__(self):
-        idx = np.random.permutation(len(self.lengths))
+        n = len(self.lengths)
+        idx = np.random.permutation(n) if self.p is None else np.random.choice(n, n, p=self.p)
         batches = []
         for s in range(0, len(idx), self.batch * self.pool):
             chunk = idx[s:s + self.batch * self.pool]
@@ -295,7 +305,14 @@ def split(index_path: Path, val_share=0.05, seed=0, per_map=3):
         count[r["lb"]] = count.get(r["lb"], 0) + 1
         if count[r["lb"]] <= per_map:
             kept.append(r)
-    songs = sorted({song_key(r) for r in kept})
+    songs = sorted({song_key(r) for r in kept if r.get("source") != LABELLED})
     rng = np.random.default_rng(seed)
     val = set(rng.choice(songs, max(1, int(len(songs) * val_share)), replace=False))
-    return [r for r in kept if song_key(r) not in val], [r for r in kept if song_key(r) in val]
+    return ([r for r in kept if song_key(r) not in val],
+            [r for r in kept if song_key(r) in val and r.get("source") != LABELLED])
+
+
+def star_weights(stars, power=0.5, step=1.0):
+    band = np.floor(np.asarray(stars) / step).astype(int)
+    _, inv, count = np.unique(band, return_inverse=True, return_counts=True)
+    return count[inv].astype(np.float64) ** -power
