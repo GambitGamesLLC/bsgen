@@ -4,6 +4,7 @@ __pycache__/
 out/
 out-*/
 gen*/
+probe*/
 gen-*/
 
 # Private test artifacts: never commit song audio, charts, or generated packages
